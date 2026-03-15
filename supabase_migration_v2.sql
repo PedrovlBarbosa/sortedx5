@@ -69,6 +69,25 @@ create table if not exists game_prints (
 
 create index if not exists idx_game_prints_created on game_prints(created_at desc);
 
+-- 6) usuarios do app (login interno + perfis)
+create table if not exists auth_users (
+  id text primary key default ('user_' || replace(gen_random_uuid()::text, '-', '')),
+  username text not null unique,
+  password_sha256 text not null,
+  role text not null,
+  recovery_sha256 text not null,
+  failed_attempts integer not null default 0,
+  locked_until timestamptz,
+  is_active boolean not null default true,
+  created_at timestamptz not null default now()
+);
+
+create index if not exists idx_auth_users_username on auth_users(username);
+
+alter table auth_users drop constraint if exists auth_users_role_check;
+alter table auth_users
+  add constraint auth_users_role_check check (role in ('admin_super', 'admin', 'standard', 'viewer'));
+
 commit;
 
 -- Verificacao rapida (opcional):

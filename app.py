@@ -36,7 +36,14 @@ RATING_DELTA = 25
 TEAM_SIZE = 5
 LANES = ["Top", "Jungle", "Mid", "ADC", "Support"]
 GAME_OPTIONS = ["CS", "LoL"]
-ALLOWED_ROLES = {"admin", "standard"}
+ROLE_ADMIN_SUPER = "admin_super"
+ROLE_ADMIN = "admin"
+ROLE_STANDARD = "standard"
+ROLE_VIEWER = "viewer"
+ALLOWED_ROLES = {ROLE_ADMIN_SUPER, ROLE_ADMIN, ROLE_STANDARD, ROLE_VIEWER}
+MAX_REDRAWS_PER_ROUND = 6
+MAX_LOGIN_ATTEMPTS = 5
+LOGIN_LOCK_MINUTES = 15
 
 
 def inject_theme() -> None:
@@ -339,43 +346,83 @@ def _clear_query_auth_token() -> None:
         pass
 
 
+def _safe_parse_iso(ts: Any) -> datetime | None:
+    text = str(ts or "").strip()
+    if not text:
+        return None
+    try:
+        return datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except Exception:
+        return None
+
+
+def _is_user_locked(user_row: dict[str, Any]) -> tuple[bool, datetime | None]:
+    dt = _safe_parse_iso(user_row.get("locked_until"))
+    if not dt:
+        return False, None
+    now = datetime.now(timezone.utc)
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt > now, dt
+
+
+def _password_valid(password: str) -> bool:
+    return len(password.strip()) >= 6
+
+
+def _bootstrap_auth_users_if_needed() -> None:
+    try:
+        if store.count_auth_users() > 0:
+            return
+    except Exception:
+        return
+
+    seed_users = _get_auth_users()
+    for u in seed_users.values():
+        username = str(u.get("username") or "").strip().lower()
+        if not username:
+            continue
+        role = _normalize_role(u.get("role"))
+        pw_hash = str(u.get("password_sha256") or "").strip().lower()
+        if not pw_hash:
+            plain = str(u.get("password") or "")
+            if not plain:
+                continue
+            pw_hash = _sha256_text(plain)
+        recovery_plain = str(u.get("recovery_phrase") or username)
+        recovery_hash = _sha256_text(recovery_plain)
+        try:
+            store.create_auth_user(username, pw_hash, role, recovery_hash, is_active=True)
+        except Exception:
+            continue
+
+
 def ensure_login() -> tuple[str, str]:
     if not _auth_enabled():
-        return "local", "admin"
+        return "local", ROLE_ADMIN_SUPER
 
-    users = _get_auth_users()
-    if not users:
-        st.error("Autenticacao habilitada, mas sem usuarios em st.secrets['auth']['users'].")
-        st.code(
-            """
-[auth]
-enabled = true
-
-[[auth.users]]
-username = "admin"
-password_sha256 = "<sha256_da_senha>"
-role = "admin"
-
-[[auth.users]]
-username = "guest"
-password_sha256 = "<sha256_da_senha>"
-role = "standard"
-            """.strip()
-        )
-        st.info("Para gerar hash SHA-256 localmente: python -c \"import hashlib; print(hashlib.sha256('SENHA'.encode()).hexdigest())\"")
-        st.stop()
+    _bootstrap_auth_users_if_needed()
 
     if st.session_state.get("auth_ok"):
-        return str(st.session_state.get("auth_user")), _normalize_role(st.session_state.get("auth_role"))
+        cached_user = str(st.session_state.get("auth_user") or "").strip().lower()
+        row = store.get_auth_user_by_username(cached_user)
+        if row and bool(row.get("is_active")):
+            role = _normalize_role(row.get("role"))
+            st.session_state["auth_role"] = role
+            st.session_state["auth_user_id"] = row.get("id")
+            return cached_user, role
+        for k in ["auth_ok", "auth_user_id", "auth_user", "auth_role"]:
+            st.session_state.pop(k, None)
 
     query_token = _get_query_auth_token()
     if query_token:
         parsed = _decode_auth_token(query_token)
         if parsed:
             user_from_token, role_from_token = parsed
-            user_cfg = users.get(user_from_token)
-            if user_cfg and _normalize_role(user_cfg.get("role")) == role_from_token:
+            user_cfg = store.get_auth_user_by_username(user_from_token)
+            if user_cfg and bool(user_cfg.get("is_active")) and _normalize_role(user_cfg.get("role")) == role_from_token:
                 st.session_state["auth_ok"] = True
+                st.session_state["auth_user_id"] = user_cfg.get("id")
                 st.session_state["auth_user"] = user_from_token
                 st.session_state["auth_role"] = role_from_token
                 return user_from_token, role_from_token
@@ -387,9 +434,10 @@ role = "standard"
             parsed = _decode_auth_token(str(cookie_token))
             if parsed:
                 user_from_cookie, role_from_cookie = parsed
-                user_cfg = users.get(user_from_cookie)
-                if user_cfg and _normalize_role(user_cfg.get("role")) == role_from_cookie:
+                user_cfg = store.get_auth_user_by_username(user_from_cookie)
+                if user_cfg and bool(user_cfg.get("is_active")) and _normalize_role(user_cfg.get("role")) == role_from_cookie:
                     st.session_state["auth_ok"] = True
+                    st.session_state["auth_user_id"] = user_cfg.get("id")
                     st.session_state["auth_user"] = user_from_cookie
                     st.session_state["auth_role"] = role_from_cookie
                     return user_from_cookie, role_from_cookie
@@ -404,17 +452,96 @@ role = "standard"
 
     if submit:
         uname = username.strip().lower()
-        user = users.get(uname)
-        if not user or not _verify_secret(password, user):
+        user = store.get_auth_user_by_username(uname)
+        if not user:
             st.error("Usuario ou senha invalidos.")
+        elif not bool(user.get("is_active")):
+            st.error("Conta desativada. Fale com um administrador.")
         else:
-            st.session_state["auth_ok"] = True
-            st.session_state["auth_user"] = user["username"]
-            st.session_state["auth_role"] = user["role"]
-            if remember:
-                _set_query_auth_token(_create_auth_token(user["username"], user["role"]))
-                _set_auth_cookie(user["username"], user["role"])
-            st.rerun()
+            locked, until = _is_user_locked(user)
+            if locked:
+                when = until.astimezone(timezone.utc).strftime("%H:%M UTC") if until else "mais tarde"
+                st.error(f"Conta temporariamente bloqueada por tentativas. Tente novamente as {when}.")
+            elif not hmac.compare_digest(str(user.get("password_sha256") or ""), _sha256_text(password)):
+                attempts = int(user.get("failed_attempts") or 0) + 1
+                lock_until = None
+                if attempts >= MAX_LOGIN_ATTEMPTS:
+                    lock_until = (datetime.now(timezone.utc) + timedelta(minutes=LOGIN_LOCK_MINUTES)).isoformat()
+                    st.error("Muitas tentativas falhas. Conta bloqueada temporariamente.")
+                else:
+                    st.error(f"Usuario ou senha invalidos. Tentativa {attempts}/{MAX_LOGIN_ATTEMPTS}.")
+                store.set_auth_user_login_state(str(user.get("id")), attempts, lock_until)
+            else:
+                store.set_auth_user_login_state(str(user.get("id")), 0, None)
+                role = _normalize_role(user.get("role"))
+                st.session_state["auth_ok"] = True
+                st.session_state["auth_user_id"] = user.get("id")
+                st.session_state["auth_user"] = str(user.get("username"))
+                st.session_state["auth_role"] = role
+                if remember:
+                    _set_query_auth_token(_create_auth_token(str(user.get("username")), role))
+                    _set_auth_cookie(str(user.get("username")), role)
+                st.rerun()
+
+    with st.expander("Criar conta"):
+        with st.form("register_form"):
+            new_user = st.text_input("Novo usuario", key="reg_user")
+            new_role = st.selectbox("Perfil", [ROLE_STANDARD, ROLE_VIEWER], key="reg_role")
+            new_pass = st.text_input("Senha", type="password", key="reg_pass")
+            new_pass2 = st.text_input("Confirmar senha", type="password", key="reg_pass2")
+            recovery_phrase = st.text_input("Frase de recuperacao", key="reg_recovery")
+            do_register = st.form_submit_button("Cadastrar")
+
+        if do_register:
+            uname = new_user.strip().lower()
+            users_count = store.count_auth_users()
+            chosen_role = ROLE_ADMIN_SUPER if users_count == 0 else new_role
+            if not uname:
+                st.warning("Informe um usuario valido.")
+            elif store.get_auth_user_by_username(uname):
+                st.error("Usuario ja existe.")
+            elif not _password_valid(new_pass):
+                st.error("Senha muito curta. Minimo de 6 caracteres.")
+            elif new_pass != new_pass2:
+                st.error("As senhas nao coincidem.")
+            elif not recovery_phrase.strip():
+                st.error("Informe uma frase de recuperacao.")
+            else:
+                store.create_auth_user(
+                    username=uname,
+                    password_sha256=_sha256_text(new_pass),
+                    role=chosen_role,
+                    recovery_sha256=_sha256_text(recovery_phrase.strip()),
+                    is_active=True,
+                )
+                if chosen_role == ROLE_ADMIN_SUPER:
+                    st.success("Primeira conta criada como admin_super. Voce ja pode fazer login.")
+                else:
+                    st.success("Conta criada. Voce ja pode fazer login.")
+
+    with st.expander("Esqueci minha senha"):
+        with st.form("forgot_form"):
+            fg_user = st.text_input("Usuario", key="fg_user")
+            fg_phrase = st.text_input("Frase de recuperacao", key="fg_phrase")
+            fg_new1 = st.text_input("Nova senha", type="password", key="fg_new1")
+            fg_new2 = st.text_input("Confirmar nova senha", type="password", key="fg_new2")
+            do_reset = st.form_submit_button("Redefinir senha")
+
+        if do_reset:
+            uname = fg_user.strip().lower()
+            user = store.get_auth_user_by_username(uname)
+            if not user:
+                st.error("Usuario nao encontrado.")
+            elif _sha256_text(fg_phrase.strip()) != str(user.get("recovery_sha256") or ""):
+                st.error("Frase de recuperacao invalida.")
+            elif not _password_valid(fg_new1):
+                st.error("Senha muito curta. Minimo de 6 caracteres.")
+            elif fg_new1 != fg_new2:
+                st.error("As senhas nao coincidem.")
+            else:
+                store.set_auth_user_password(str(user.get("id")), _sha256_text(fg_new1))
+                store.set_auth_user_login_state(str(user.get("id")), 0, None)
+                st.success("Senha redefinida com sucesso.")
 
     st.stop()
 
@@ -495,6 +622,36 @@ class DataStore:
     def delete_game_print(self, print_id: Any) -> None:
         raise NotImplementedError
 
+    def count_auth_users(self) -> int:
+        raise NotImplementedError
+
+    def create_auth_user(self, username: str, password_sha256: str, role: str, recovery_sha256: str, is_active: bool = True) -> None:
+        raise NotImplementedError
+
+    def get_auth_user_by_username(self, username: str) -> dict[str, Any] | None:
+        raise NotImplementedError
+
+    def list_auth_users(self) -> list[dict[str, Any]]:
+        raise NotImplementedError
+
+    def set_auth_user_role(self, user_id: str, role: str) -> None:
+        raise NotImplementedError
+
+    def set_auth_user_active(self, user_id: str, is_active: bool) -> None:
+        raise NotImplementedError
+
+    def set_auth_user_password(self, user_id: str, password_sha256: str) -> None:
+        raise NotImplementedError
+
+    def set_auth_user_recovery(self, user_id: str, recovery_sha256: str) -> None:
+        raise NotImplementedError
+
+    def set_auth_user_login_state(self, user_id: str, failed_attempts: int, locked_until: str | None) -> None:
+        raise NotImplementedError
+
+    def delete_auth_user(self, user_id: str) -> None:
+        raise NotImplementedError
+
 
 class LocalSQLiteStore(DataStore):
     def __init__(self, db_path: str):
@@ -561,6 +718,18 @@ class LocalSQLiteStore(DataStore):
                     created_by text,
                     created_at text not null
                 );
+
+                create table if not exists auth_users (
+                    id text primary key,
+                    username text not null unique,
+                    password_sha256 text not null,
+                    role text not null,
+                    recovery_sha256 text not null,
+                    failed_attempts integer not null default 0,
+                    locked_until text,
+                    is_active integer not null default 1,
+                    created_at text not null
+                );
                 """
             )
 
@@ -591,6 +760,7 @@ class LocalSQLiteStore(DataStore):
                 create index if not exists idx_matches_game on matches(game);
                 create index if not exists idx_mp_match on match_players(match_id);
                 create index if not exists idx_prints_created on game_prints(created_at desc);
+                create index if not exists idx_auth_users_username on auth_users(username);
                 """
             )
 
@@ -767,6 +937,80 @@ class LocalSQLiteStore(DataStore):
         with self._conn() as conn:
             conn.execute("delete from game_prints where id = ?", (print_id,))
 
+    def count_auth_users(self) -> int:
+        with self._conn() as conn:
+            row = conn.execute("select count(1) as n from auth_users").fetchone()
+        return int(row["n"]) if row else 0
+
+    def create_auth_user(self, username: str, password_sha256: str, role: str, recovery_sha256: str, is_active: bool = True) -> None:
+        with self._conn() as conn:
+            conn.execute(
+                """
+                insert into auth_users (id, username, password_sha256, role, recovery_sha256, failed_attempts, locked_until, is_active, created_at)
+                values (?, ?, ?, ?, ?, 0, null, ?, ?)
+                """,
+                (
+                    f"user_{uuid4()}",
+                    username,
+                    password_sha256,
+                    role,
+                    recovery_sha256,
+                    1 if is_active else 0,
+                    now_iso(),
+                ),
+            )
+
+    def get_auth_user_by_username(self, username: str) -> dict[str, Any] | None:
+        with self._conn() as conn:
+            row = conn.execute(
+                """
+                select id, username, password_sha256, role, recovery_sha256, failed_attempts, locked_until, is_active, created_at
+                from auth_users
+                where username = ?
+                limit 1
+                """,
+                (username,),
+            ).fetchone()
+        return dict(row) if row else None
+
+    def list_auth_users(self) -> list[dict[str, Any]]:
+        with self._conn() as conn:
+            rows = conn.execute(
+                """
+                select id, username, role, failed_attempts, locked_until, is_active, created_at
+                from auth_users
+                order by username asc
+                """
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    def set_auth_user_role(self, user_id: str, role: str) -> None:
+        with self._conn() as conn:
+            conn.execute("update auth_users set role = ? where id = ?", (role, user_id))
+
+    def set_auth_user_active(self, user_id: str, is_active: bool) -> None:
+        with self._conn() as conn:
+            conn.execute("update auth_users set is_active = ? where id = ?", (1 if is_active else 0, user_id))
+
+    def set_auth_user_password(self, user_id: str, password_sha256: str) -> None:
+        with self._conn() as conn:
+            conn.execute("update auth_users set password_sha256 = ? where id = ?", (password_sha256, user_id))
+
+    def set_auth_user_recovery(self, user_id: str, recovery_sha256: str) -> None:
+        with self._conn() as conn:
+            conn.execute("update auth_users set recovery_sha256 = ? where id = ?", (recovery_sha256, user_id))
+
+    def set_auth_user_login_state(self, user_id: str, failed_attempts: int, locked_until: str | None) -> None:
+        with self._conn() as conn:
+            conn.execute(
+                "update auth_users set failed_attempts = ?, locked_until = ? where id = ?",
+                (failed_attempts, locked_until, user_id),
+            )
+
+    def delete_auth_user(self, user_id: str) -> None:
+        with self._conn() as conn:
+            conn.execute("delete from auth_users where id = ?", (user_id,))
+
 
 class SupabaseStore(DataStore):
     def __init__(self, client: Any):
@@ -878,6 +1122,60 @@ class SupabaseStore(DataStore):
 
     def delete_game_print(self, print_id: Any) -> None:
         self.client.table("game_prints").delete().eq("id", print_id).execute()
+
+    def count_auth_users(self) -> int:
+        rows = cast(list[dict[str, Any]], self.client.table("auth_users").select("id").limit(1_000).execute().data)
+        return len(rows)
+
+    def create_auth_user(self, username: str, password_sha256: str, role: str, recovery_sha256: str, is_active: bool = True) -> None:
+        self.client.table("auth_users").insert(
+            {
+                "username": username,
+                "password_sha256": password_sha256,
+                "role": role,
+                "recovery_sha256": recovery_sha256,
+                "failed_attempts": 0,
+                "locked_until": None,
+                "is_active": is_active,
+            }
+        ).execute()
+
+    def get_auth_user_by_username(self, username: str) -> dict[str, Any] | None:
+        rows = cast(
+            list[dict[str, Any]],
+            self.client.table("auth_users").select("*").eq("username", username).limit(1).execute().data,
+        )
+        return rows[0] if rows else None
+
+    def list_auth_users(self) -> list[dict[str, Any]]:
+        return cast(
+            list[dict[str, Any]],
+            self.client.table("auth_users")
+            .select("id, username, role, failed_attempts, locked_until, is_active, created_at")
+            .order("username", desc=False)
+            .execute()
+            .data,
+        )
+
+    def set_auth_user_role(self, user_id: str, role: str) -> None:
+        self.client.table("auth_users").update({"role": role}).eq("id", user_id).execute()
+
+    def set_auth_user_active(self, user_id: str, is_active: bool) -> None:
+        self.client.table("auth_users").update({"is_active": is_active}).eq("id", user_id).execute()
+
+    def set_auth_user_password(self, user_id: str, password_sha256: str) -> None:
+        self.client.table("auth_users").update({"password_sha256": password_sha256}).eq("id", user_id).execute()
+
+    def set_auth_user_recovery(self, user_id: str, recovery_sha256: str) -> None:
+        self.client.table("auth_users").update({"recovery_sha256": recovery_sha256}).eq("id", user_id).execute()
+
+    def set_auth_user_login_state(self, user_id: str, failed_attempts: int, locked_until: str | None) -> None:
+        self.client.table("auth_users").update(
+            {"failed_attempts": failed_attempts, "locked_until": locked_until}
+        ).eq("id", user_id).execute()
+
+    def delete_auth_user(self, user_id: str) -> None:
+        self.client.table("auth_users").delete().eq("id", user_id).execute()
 
 
 @st.cache_resource
@@ -1050,6 +1348,7 @@ def ensure_mm_state(game: str) -> None:
         ("selected_ids", []),
         ("roles_a", {}),
         ("roles_b", {}),
+        ("redraw_count", 0),
     ]:
         sk = game_state_key(game, key)
         if sk not in st.session_state:
@@ -1069,16 +1368,21 @@ if st.sidebar.button("Atualizar dados agora"):
     st.rerun()
 
 if st.sidebar.button("Sair"):
-    for k in ["auth_ok", "auth_user", "auth_role"]:
+    for k in ["auth_ok", "auth_user_id", "auth_user", "auth_role"]:
         st.session_state.pop(k, None)
     _clear_query_auth_token()
     _clear_auth_cookie()
     st.rerun()
 
-if current_role == "admin":
-    pages = ["Jogadores", "Matchmaking", "Prints", "Ranking", "Historico"]
+is_admin = current_role in (ROLE_ADMIN_SUPER, ROLE_ADMIN)
+is_super_admin = current_role == ROLE_ADMIN_SUPER
+
+if current_role in (ROLE_ADMIN_SUPER, ROLE_ADMIN):
+    pages = ["Jogadores", "Matchmaking", "Prints", "Ranking", "Historico", "Admin Usuarios"]
+elif current_role == ROLE_STANDARD:
+    pages = ["Matchmaking", "Prints", "Ranking", "Historico"]
 else:
-    pages = ["Matchmaking", "Prints"]
+    pages = ["Prints", "Ranking", "Historico"]
 
 page = st.sidebar.radio("Navegacao", pages)
 
@@ -1186,9 +1490,12 @@ elif page == "Matchmaking":
         st.session_state[game_state_key(game, "team_a")] = ta
         st.session_state[game_state_key(game, "team_b")] = tb
         st.session_state[game_state_key(game, "selected_ids")] = [p["id"] for p in chosen]
+        st.session_state[game_state_key(game, "redraw_count")] = 0
         st.rerun()
 
-    if c2.button("Sortear novamente", key=game_state_key(game, "redraw")):
+    redraw_count = int(st.session_state[game_state_key(game, "redraw_count")])
+    redraw_disabled = redraw_count >= MAX_REDRAWS_PER_ROUND
+    if c2.button("Sortear novamente", key=game_state_key(game, "redraw"), disabled=redraw_disabled):
         selected_ids = st.session_state[game_state_key(game, "selected_ids")]
         chosen = [p for p in players if p["id"] in selected_ids]
         if len(chosen) == 10:
@@ -1202,7 +1509,19 @@ elif page == "Matchmaking":
                 st.session_state[game_state_key(game, "roles_b")] = rb
             st.session_state[game_state_key(game, "team_a")] = ta
             st.session_state[game_state_key(game, "team_b")] = tb
+            st.session_state[game_state_key(game, "redraw_count")] = redraw_count + 1
             st.rerun()
+
+    if c3.button("Limpar sorteador", key=game_state_key(game, "clear")):
+        for sfx in ["team_a", "team_b", "selected_ids", "roles_a", "roles_b"]:
+            st.session_state[game_state_key(game, sfx)] = [] if sfx in ("team_a", "team_b", "selected_ids") else {}
+        st.session_state[game_state_key(game, "selected_names")] = []
+        st.session_state[game_state_key(game, "redraw_count")] = 0
+        st.rerun()
+
+    st.caption(f"Re-sorteios usados: {redraw_count}/{MAX_REDRAWS_PER_ROUND}")
+    if redraw_disabled:
+        st.warning("Limite de re-sorteios atingido nesta rodada. Clique em 'Limpar sorteador' para iniciar outra.")
 
     st.markdown("<span class='sx-kpi'>CS usa cs_rating</span><span class='sx-kpi'>LoL usa lol_rating + lanes</span>", unsafe_allow_html=True)
 
@@ -1234,7 +1553,7 @@ elif page == "Matchmaking":
 
         st.caption(f"Diferenca de media: {abs(avg_a - avg_b):.1f}")
 
-        if current_role == "admin":
+        if is_admin:
             st.divider()
             winner = st.radio("Quem venceu?", ["Time A", "Time B"], horizontal=True, key=game_state_key(game, "winner"))
             if st.button("Registrar partida", key=game_state_key(game, "register")):
@@ -1242,6 +1561,8 @@ elif page == "Matchmaking":
                 st.success("Partida registrada e ratings atualizados.")
                 for sfx in ["team_a", "team_b", "selected_ids", "roles_a", "roles_b"]:
                     st.session_state[game_state_key(game, sfx)] = [] if sfx in ("team_a", "team_b", "selected_ids") else {}
+                st.session_state[game_state_key(game, "selected_names")] = []
+                st.session_state[game_state_key(game, "redraw_count")] = 0
                 st.rerun()
         else:
             st.info("Perfil padrao pode apenas selecionar jogadores e sortear times.")
@@ -1291,7 +1612,7 @@ elif page == "Prints":
     st.markdown("## Repositorio de Prints")
     st.markdown("<div class='sx-sub'>Galeria compartilhada para guardar momentos das partidas.</div>", unsafe_allow_html=True)
 
-    if current_role == "admin":
+    if is_admin:
         with st.form("add_print_form", clear_on_submit=True):
             t1, t2 = st.columns([2, 1])
             print_title = t1.text_input("Titulo")
@@ -1349,11 +1670,109 @@ elif page == "Prints":
                 if note:
                     st.write(note)
 
-                if current_role == "admin":
+                if is_admin:
                     if st.button("Remover print", key=f"del_print_{item['id']}"):
                         store.delete_game_print(item["id"])
                         st.success("Print removido.")
                         st.rerun()
+
+elif page == "Admin Usuarios":
+    if not is_admin:
+        st.error("Acesso negado.")
+        st.stop()
+
+    st.markdown("## Admin - Usuarios")
+    st.markdown("<div class='sx-sub'>Gerencie contas, perfis, bloqueios e reset de senha.</div>", unsafe_allow_html=True)
+
+    allowed_create_roles = [ROLE_STANDARD, ROLE_VIEWER] if not is_super_admin else [ROLE_ADMIN_SUPER, ROLE_ADMIN, ROLE_STANDARD, ROLE_VIEWER]
+
+    with st.form("admin_create_user"):
+        c1, c2 = st.columns(2)
+        new_user = c1.text_input("Novo usuario")
+        new_role = c2.selectbox("Perfil", allowed_create_roles)
+        p1, p2 = st.columns(2)
+        new_pass = p1.text_input("Senha inicial", type="password")
+        new_pass2 = p2.text_input("Confirmar senha", type="password")
+        recovery_phrase = st.text_input("Frase de recuperacao")
+        add_submit = st.form_submit_button("Criar usuario")
+
+    if add_submit:
+        uname = new_user.strip().lower()
+        if not uname:
+            st.warning("Usuario invalido.")
+        elif store.get_auth_user_by_username(uname):
+            st.error("Usuario ja existe.")
+        elif not _password_valid(new_pass):
+            st.error("Senha muito curta. Minimo de 6 caracteres.")
+        elif new_pass != new_pass2:
+            st.error("As senhas nao coincidem.")
+        elif not recovery_phrase.strip():
+            st.error("Informe frase de recuperacao.")
+        else:
+            store.create_auth_user(
+                username=uname,
+                password_sha256=_sha256_text(new_pass),
+                role=new_role,
+                recovery_sha256=_sha256_text(recovery_phrase.strip()),
+                is_active=True,
+            )
+            st.success("Usuario criado.")
+            st.rerun()
+
+    users = store.list_auth_users()
+    current_uid = str(st.session_state.get("auth_user_id") or "")
+    for u in users:
+        uid = str(u.get("id") or "")
+        uname = str(u.get("username") or "")
+        urole = _normalize_role(u.get("role"))
+        active = bool(u.get("is_active"))
+        locked, _ = _is_user_locked(u)
+        title = f"{uname} | {urole} | {'ativo' if active else 'inativo'}{' | bloqueado' if locked else ''}"
+
+        with st.expander(title):
+            can_manage = is_super_admin or (urole not in (ROLE_ADMIN_SUPER, ROLE_ADMIN))
+            if uid == current_uid:
+                st.caption("Esta e sua conta atual.")
+
+            role_options = [ROLE_STANDARD, ROLE_VIEWER] if not is_super_admin else [ROLE_ADMIN_SUPER, ROLE_ADMIN, ROLE_STANDARD, ROLE_VIEWER]
+            role_index = role_options.index(urole) if urole in role_options else 0
+            new_role_for_user = st.selectbox("Perfil", role_options, index=role_index, key=f"role_{uid}", disabled=not can_manage)
+
+            col_a, col_b = st.columns(2)
+            if col_a.button("Salvar perfil", key=f"save_role_{uid}", disabled=not can_manage):
+                store.set_auth_user_role(uid, new_role_for_user)
+                st.success("Perfil atualizado.")
+                st.rerun()
+
+            toggle_label = "Desativar" if active else "Ativar"
+            if col_b.button(toggle_label, key=f"toggle_{uid}", disabled=(not can_manage) or uid == current_uid):
+                store.set_auth_user_active(uid, not active)
+                st.success("Status atualizado.")
+                st.rerun()
+
+            np1, np2 = st.columns(2)
+            new_pass_admin = np1.text_input("Nova senha", type="password", key=f"pwd_{uid}", disabled=not can_manage)
+            new_recovery_admin = np2.text_input("Nova frase recuperacao", key=f"rec_{uid}", disabled=not can_manage)
+            if st.button("Resetar senha", key=f"reset_pwd_{uid}", disabled=not can_manage):
+                if not _password_valid(new_pass_admin):
+                    st.error("Senha muito curta. Minimo de 6 caracteres.")
+                elif not new_recovery_admin.strip():
+                    st.error("Frase de recuperacao invalida.")
+                else:
+                    store.set_auth_user_password(uid, _sha256_text(new_pass_admin))
+                    store.set_auth_user_recovery(uid, _sha256_text(new_recovery_admin.strip()))
+                    store.set_auth_user_login_state(uid, 0, None)
+                    st.success("Senha/frase redefinidas e bloqueio limpo.")
+                    st.rerun()
+
+            confirm_del = st.checkbox("Confirmar exclusao", key=f"del_confirm_{uid}", disabled=(not can_manage) or uid == current_uid)
+            if st.button("Excluir usuario", key=f"del_user_{uid}", disabled=(not can_manage) or uid == current_uid):
+                if not confirm_del:
+                    st.warning("Marque a confirmacao para excluir.")
+                else:
+                    store.delete_auth_user(uid)
+                    st.success("Usuario excluido.")
+                    st.rerun()
 
 elif page == "Historico":
     st.markdown("## Historico")
