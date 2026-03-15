@@ -224,11 +224,12 @@ def _auth_enabled() -> bool:
     return True
 
 
-@st.cache_resource
 def get_cookie_manager() -> Any:
     if stx is None:
         return None
-    return stx.CookieManager()
+    if "_sx_cookie_manager" not in st.session_state:
+        st.session_state["_sx_cookie_manager"] = stx.CookieManager()
+    return st.session_state["_sx_cookie_manager"]
 
 
 def _auth_cookie_name() -> str:
