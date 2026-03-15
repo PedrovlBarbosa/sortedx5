@@ -5,6 +5,7 @@ Streamlit + Local SQLite (default) / Supabase (optional)
 
 from __future__ import annotations
 
+import base64
 from collections.abc import Mapping
 from datetime import datetime, timezone
 import hashlib
@@ -303,12 +304,16 @@ class DataStore:
     def update_player_profile(
         self,
         player_id: str,
+        name: str,
         cs_rating: int,
         lol_rating: int,
         lane_1: str,
         lane_2: str,
         lane_3: str,
     ) -> None:
+        raise NotImplementedError
+
+    def delete_player(self, player_id: str) -> None:
         raise NotImplementedError
 
     def create_match(self, game: str, winner: str, team_a_avg: float, team_b_avg: float) -> str:
@@ -330,6 +335,15 @@ class DataStore:
         raise NotImplementedError
 
     def get_match_players_by_match(self, match_id: str) -> list[dict[str, Any]]:
+        raise NotImplementedError
+
+    def add_game_print(self, title: str, game: str, note: str, image_b64: str, mime_type: str, created_by: str) -> None:
+        raise NotImplementedError
+
+    def get_recent_game_prints(self, limit: int = 60) -> list[dict[str, Any]]:
+        raise NotImplementedError
+
+    def delete_game_print(self, print_id: Any) -> None:
         raise NotImplementedError
 
 
@@ -387,6 +401,17 @@ class LocalSQLiteStore(DataStore):
                     foreign key (match_id) references matches(id) on delete cascade,
                     foreign key (player_id) references players(id) on delete cascade
                 );
+
+                create table if not exists game_prints (
+                    id integer primary key autoincrement,
+                    title text not null,
+                    game text not null,
+                    note text,
+                    image_b64 text not null,
+                    mime_type text not null,
+                    created_by text,
+                    created_at text not null
+                );
                 """
             )
 
@@ -416,6 +441,7 @@ class LocalSQLiteStore(DataStore):
                 create index if not exists idx_matches_created on matches(created_at desc);
                 create index if not exists idx_matches_game on matches(game);
                 create index if not exists idx_mp_match on match_players(match_id);
+                create index if not exists idx_prints_created on game_prints(created_at desc);
                 """
             )
 
@@ -472,6 +498,7 @@ class LocalSQLiteStore(DataStore):
     def update_player_profile(
         self,
         player_id: str,
+        name: str,
         cs_rating: int,
         lol_rating: int,
         lane_1: str,
@@ -482,11 +509,15 @@ class LocalSQLiteStore(DataStore):
             conn.execute(
                 """
                 update players
-                set cs_rating = ?, lol_rating = ?, lol_lane_1 = ?, lol_lane_2 = ?, lol_lane_3 = ?
+                set name = ?, cs_rating = ?, lol_rating = ?, lol_lane_1 = ?, lol_lane_2 = ?, lol_lane_3 = ?
                 where id = ?
                 """,
-                (cs_rating, lol_rating, lane_1, lane_2, lane_3, player_id),
+                (name, cs_rating, lol_rating, lane_1, lane_2, lane_3, player_id),
             )
+
+    def delete_player(self, player_id: str) -> None:
+        with self._conn() as conn:
+            conn.execute("delete from players where id = ?", (player_id,))
 
     def create_match(self, game: str, winner: str, team_a_avg: float, team_b_avg: float) -> str:
         match_id = f"match_{uuid4()}"
@@ -560,6 +591,33 @@ class LocalSQLiteStore(DataStore):
             ).fetchall()
         return [dict(r) for r in rows]
 
+    def add_game_print(self, title: str, game: str, note: str, image_b64: str, mime_type: str, created_by: str) -> None:
+        with self._conn() as conn:
+            conn.execute(
+                """
+                insert into game_prints (title, game, note, image_b64, mime_type, created_by, created_at)
+                values (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (title, game, note, image_b64, mime_type, created_by, now_iso()),
+            )
+
+    def get_recent_game_prints(self, limit: int = 60) -> list[dict[str, Any]]:
+        with self._conn() as conn:
+            rows = conn.execute(
+                """
+                select id, title, game, note, image_b64, mime_type, created_by, created_at
+                from game_prints
+                order by created_at desc
+                limit ?
+                """,
+                (limit,),
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    def delete_game_print(self, print_id: Any) -> None:
+        with self._conn() as conn:
+            conn.execute("delete from game_prints where id = ?", (print_id,))
+
 
 class SupabaseStore(DataStore):
     def __init__(self, client: Any):
@@ -599,6 +657,7 @@ class SupabaseStore(DataStore):
     def update_player_profile(
         self,
         player_id: str,
+        name: str,
         cs_rating: int,
         lol_rating: int,
         lane_1: str,
@@ -607,6 +666,7 @@ class SupabaseStore(DataStore):
     ) -> None:
         self.client.table("players").update(
             {
+                "name": name,
                 "cs_rating": cs_rating,
                 "lol_rating": lol_rating,
                 "lol_lane_1": lane_1,
@@ -614,6 +674,9 @@ class SupabaseStore(DataStore):
                 "lol_lane_3": lane_3,
             }
         ).eq("id", player_id).execute()
+
+    def delete_player(self, player_id: str) -> None:
+        self.client.table("players").delete().eq("id", player_id).execute()
 
     def create_match(self, game: str, winner: str, team_a_avg: float, team_b_avg: float) -> str:
         row = (
@@ -645,6 +708,27 @@ class SupabaseStore(DataStore):
 
     def get_match_players_by_match(self, match_id: str) -> list[dict[str, Any]]:
         return cast(list[dict[str, Any]], self.client.table("match_players").select("*").eq("match_id", match_id).execute().data)
+
+    def add_game_print(self, title: str, game: str, note: str, image_b64: str, mime_type: str, created_by: str) -> None:
+        self.client.table("game_prints").insert(
+            {
+                "title": title,
+                "game": game,
+                "note": note,
+                "image_b64": image_b64,
+                "mime_type": mime_type,
+                "created_by": created_by,
+            }
+        ).execute()
+
+    def get_recent_game_prints(self, limit: int = 60) -> list[dict[str, Any]]:
+        return cast(
+            list[dict[str, Any]],
+            self.client.table("game_prints").select("*").order("created_at", desc=True).limit(limit).execute().data,
+        )
+
+    def delete_game_print(self, print_id: Any) -> None:
+        self.client.table("game_prints").delete().eq("id", print_id).execute()
 
 
 @st.cache_resource
@@ -833,9 +917,9 @@ if st.sidebar.button("Sair"):
     st.rerun()
 
 if current_role == "admin":
-    pages = ["Jogadores", "Matchmaking", "Ranking", "Historico"]
+    pages = ["Jogadores", "Matchmaking", "Prints", "Ranking", "Historico"]
 else:
-    pages = ["Matchmaking"]
+    pages = ["Matchmaking", "Prints"]
 
 page = st.sidebar.radio("Navegacao", pages)
 
@@ -875,18 +959,40 @@ if page == "Jogadores":
     else:
         for p in players:
             with st.expander(f"{p['name']} - {profile_badge(p)}"):
-                e1, e2, e3 = st.columns([1, 1, 2])
+                n1, e1, e2 = st.columns([2, 1, 1])
+                name_new = n1.text_input("Nome", value=str(p["name"]), key=f"name_{p['id']}")
                 cs_new = e1.number_input("CS", min_value=0, value=int(p["cs_rating"]), step=25, key=f"cs_{p['id']}")
                 lol_new = e2.number_input("LoL", min_value=0, value=int(p["lol_rating"]), step=25, key=f"lol_{p['id']}")
-                ln1, ln2, ln3 = e3.columns(3)
+                ln1, ln2, ln3 = st.columns(3)
                 lane1 = ln1.selectbox("Lane #1", [""] + LANES, index=([""] + LANES).index(p.get("lol_lane_1", "") if p.get("lol_lane_1", "") in LANES else ""), key=f"l1_{p['id']}")
                 lane2 = ln2.selectbox("Lane #2", [""] + LANES, index=([""] + LANES).index(p.get("lol_lane_2", "") if p.get("lol_lane_2", "") in LANES else ""), key=f"l2_{p['id']}")
                 lane3 = ln3.selectbox("Lane #3", [""] + LANES, index=([""] + LANES).index(p.get("lol_lane_3", "") if p.get("lol_lane_3", "") in LANES else ""), key=f"l3_{p['id']}")
 
-                if st.button("Salvar perfil", key=f"save_{p['id']}"):
-                    store.update_player_profile(p["id"], int(cs_new), int(lol_new), lane1, lane2, lane3)
-                    st.success("Perfil atualizado.")
-                    st.rerun()
+                action_left, action_right = st.columns(2)
+                if action_left.button("Salvar alteracoes", key=f"save_{p['id']}"):
+                    clean_name = name_new.strip()
+                    if not clean_name:
+                        st.warning("Nome nao pode ficar vazio.")
+                    else:
+                        duplicate = any(
+                            other["id"] != p["id"] and str(other["name"]).strip().lower() == clean_name.lower()
+                            for other in players
+                        )
+                        if duplicate:
+                            st.error("Ja existe jogador com esse nome.")
+                        else:
+                            store.update_player_profile(p["id"], clean_name, int(cs_new), int(lol_new), lane1, lane2, lane3)
+                            st.success("Perfil atualizado.")
+                            st.rerun()
+
+                confirm_delete = st.checkbox("Confirmar exclusao", key=f"confirm_delete_{p['id']}")
+                if action_right.button("Excluir jogador", key=f"delete_{p['id']}"):
+                    if not confirm_delete:
+                        st.warning("Marque 'Confirmar exclusao' para remover o jogador.")
+                    else:
+                        store.delete_player(p["id"])
+                        st.success("Jogador removido.")
+                        st.rerun()
 
 elif page == "Matchmaking":
     st.markdown("## Matchmaking")
@@ -1021,6 +1127,74 @@ elif page == "Ranking":
         )
 
     st.dataframe(rows, hide_index=True, use_container_width=True)
+
+elif page == "Prints":
+    st.markdown("## Repositorio de Prints")
+    st.markdown("<div class='sx-sub'>Galeria compartilhada para guardar momentos das partidas.</div>", unsafe_allow_html=True)
+
+    if current_role == "admin":
+        with st.form("add_print_form", clear_on_submit=True):
+            t1, t2 = st.columns([2, 1])
+            print_title = t1.text_input("Titulo")
+            print_game = t2.selectbox("Jogo", ["Geral"] + GAME_OPTIONS)
+            print_note = st.text_area("Descricao (opcional)", max_chars=500)
+            print_file = st.file_uploader("Arquivo de imagem", type=["png", "jpg", "jpeg", "webp"])
+            publish = st.form_submit_button("Publicar print")
+
+        if publish:
+            clean_title = print_title.strip()
+            if not clean_title:
+                st.warning("Informe um titulo para o print.")
+            elif print_file is None:
+                st.warning("Selecione uma imagem.")
+            else:
+                raw = print_file.getvalue()
+                if not raw:
+                    st.warning("Arquivo vazio.")
+                elif len(raw) > 4 * 1024 * 1024:
+                    st.warning("Imagem muito grande. Limite de 4MB por print.")
+                else:
+                    mime = str(print_file.type or "image/png")
+                    encoded = base64.b64encode(raw).decode("ascii")
+                    store.add_game_print(
+                        title=clean_title,
+                        game=print_game,
+                        note=print_note.strip(),
+                        image_b64=encoded,
+                        mime_type=mime,
+                        created_by=current_user,
+                    )
+                    st.success("Print publicado.")
+                    st.rerun()
+    else:
+        st.info("Somente admin pode publicar/remover prints. Todos podem visualizar.")
+
+    prints = store.get_recent_game_prints(limit=80)
+    if not prints:
+        st.info("Nenhum print publicado ainda.")
+    else:
+        for item in prints:
+            title = item.get("title") or "Sem titulo"
+            game = item.get("game") or "Geral"
+            who = item.get("created_by") or "desconhecido"
+            ts = str(item.get("created_at") or "").replace("T", " ")[:16]
+            with st.expander(f"{game} | {title} | {ts}"):
+                payload = item.get("image_b64") or ""
+                mime = item.get("mime_type") or "image/png"
+                try:
+                    st.image(base64.b64decode(payload), caption=f"por {who}", use_container_width=True)
+                except Exception:
+                    st.error("Nao foi possivel renderizar esta imagem.")
+
+                note = str(item.get("note") or "").strip()
+                if note:
+                    st.write(note)
+
+                if current_role == "admin":
+                    if st.button("Remover print", key=f"del_print_{item['id']}"):
+                        store.delete_game_print(item["id"])
+                        st.success("Print removido.")
+                        st.rerun()
 
 elif page == "Historico":
     st.markdown("## Historico")

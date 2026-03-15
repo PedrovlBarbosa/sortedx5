@@ -55,6 +55,20 @@ create index if not exists idx_players_lol_rating on players(lol_rating desc);
 create index if not exists idx_matches_game on matches(game);
 create index if not exists idx_match_players_role on match_players(role);
 
+-- 5) repositorio de prints dos jogos
+create table if not exists game_prints (
+  id bigserial primary key,
+  title text not null,
+  game text not null default 'Geral',
+  note text,
+  image_b64 text not null,
+  mime_type text not null,
+  created_by text,
+  created_at timestamptz not null default now()
+);
+
+create index if not exists idx_game_prints_created on game_prints(created_at desc);
+
 commit;
 
 -- Verificacao rapida (opcional):
