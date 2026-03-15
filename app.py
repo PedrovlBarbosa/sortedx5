@@ -5,7 +5,10 @@ Streamlit + Local SQLite (default) / Supabase (optional)
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from datetime import datetime, timezone
+import hashlib
+import hmac
 from itertools import combinations, permutations
 import random
 import sqlite3
@@ -28,6 +31,7 @@ RATING_DELTA = 25
 TEAM_SIZE = 5
 LANES = ["Top", "Jungle", "Mid", "ADC", "Support"]
 GAME_OPTIONS = ["CS", "LoL"]
+ALLOWED_ROLES = {"admin", "standard"}
 
 
 def inject_theme() -> None:
@@ -164,6 +168,105 @@ def inject_theme() -> None:
 
 def now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def _normalize_role(role: Any) -> str:
+    value = str(role or "standard").strip().lower()
+    return value if value in ALLOWED_ROLES else "standard"
+
+
+def _sha256_text(text: str) -> str:
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def _verify_secret(password: str, user_cfg: dict[str, Any]) -> bool:
+    hash_value = str(user_cfg.get("password_sha256") or "").strip().lower()
+    plain_value = str(user_cfg.get("password") or "")
+
+    if hash_value:
+        return hmac.compare_digest(_sha256_text(password), hash_value)
+    if plain_value:
+        return hmac.compare_digest(password, plain_value)
+    return False
+
+
+def _get_auth_users() -> dict[str, dict[str, Any]]:
+    auth_cfg = st.secrets.get("auth", {})
+    raw_users = auth_cfg.get("users", []) if isinstance(auth_cfg, Mapping) else []
+    users: dict[str, dict[str, Any]] = {}
+    if not isinstance(raw_users, list):
+        return users
+
+    for raw in raw_users:
+        if not isinstance(raw, dict):
+            continue
+        username = str(raw.get("username") or "").strip().lower()
+        if not username:
+            continue
+        users[username] = {
+            "username": username,
+            "role": _normalize_role(raw.get("role")),
+            "password": str(raw.get("password") or ""),
+            "password_sha256": str(raw.get("password_sha256") or ""),
+        }
+    return users
+
+
+def _auth_enabled() -> bool:
+    auth_cfg = st.secrets.get("auth", {})
+    if isinstance(auth_cfg, Mapping) and "enabled" in auth_cfg:
+        return bool(auth_cfg.get("enabled"))
+    return True
+
+
+def ensure_login() -> tuple[str, str]:
+    if not _auth_enabled():
+        return "local", "admin"
+
+    users = _get_auth_users()
+    if not users:
+        st.error("Autenticacao habilitada, mas sem usuarios em st.secrets['auth']['users'].")
+        st.code(
+            """
+[auth]
+enabled = true
+
+[[auth.users]]
+username = "admin"
+password_sha256 = "<sha256_da_senha>"
+role = "admin"
+
+[[auth.users]]
+username = "guest"
+password_sha256 = "<sha256_da_senha>"
+role = "standard"
+            """.strip()
+        )
+        st.info("Para gerar hash SHA-256 localmente: python -c \"import hashlib; print(hashlib.sha256('SENHA'.encode()).hexdigest())\"")
+        st.stop()
+
+    if st.session_state.get("auth_ok"):
+        return str(st.session_state.get("auth_user")), _normalize_role(st.session_state.get("auth_role"))
+
+    st.markdown("## Login")
+    st.caption("Acesso restrito por perfil.")
+    with st.form("login_form"):
+        username = st.text_input("Usuario")
+        password = st.text_input("Senha", type="password")
+        submit = st.form_submit_button("Entrar")
+
+    if submit:
+        uname = username.strip().lower()
+        user = users.get(uname)
+        if not user or not _verify_secret(password, user):
+            st.error("Usuario ou senha invalidos.")
+        else:
+            st.session_state["auth_ok"] = True
+            st.session_state["auth_user"] = user["username"]
+            st.session_state["auth_role"] = user["role"]
+            st.rerun()
+
+    st.stop()
 
 
 def normalize_player(player: dict[str, Any]) -> dict[str, Any]:
@@ -561,6 +664,7 @@ def get_store() -> DataStore:
 
 store = get_store()
 inject_theme()
+current_user, current_role = ensure_login()
 
 
 def rating_key(game: str) -> str:
@@ -722,8 +826,18 @@ def ensure_mm_state(game: str) -> None:
 st.sidebar.title("SortedX5")
 mode_label = "LOCAL (SQLite)" if store.is_local() else "SUPABASE"
 st.sidebar.caption(f"Modo de dados: {mode_label}")
+st.sidebar.caption(f"Usuario: {current_user} ({current_role})")
+if st.sidebar.button("Sair"):
+    for k in ["auth_ok", "auth_user", "auth_role"]:
+        st.session_state.pop(k, None)
+    st.rerun()
 
-page = st.sidebar.radio("Navegacao", ["Jogadores", "Matchmaking", "Ranking", "Historico"])
+if current_role == "admin":
+    pages = ["Jogadores", "Matchmaking", "Ranking", "Historico"]
+else:
+    pages = ["Matchmaking"]
+
+page = st.sidebar.radio("Navegacao", pages)
 
 players = store.load_players()
 
@@ -855,14 +969,17 @@ elif page == "Matchmaking":
 
         st.caption(f"Diferenca de media: {abs(avg_a - avg_b):.1f}")
 
-        st.divider()
-        winner = st.radio("Quem venceu?", ["Time A", "Time B"], horizontal=True, key=game_state_key(game, "winner"))
-        if st.button("Registrar partida", key=game_state_key(game, "register")):
-            register_match(game, team_a, team_b, winner, roles_a if game == "LoL" else None, roles_b if game == "LoL" else None)
-            st.success("Partida registrada e ratings atualizados.")
-            for sfx in ["team_a", "team_b", "selected_ids", "roles_a", "roles_b"]:
-                st.session_state[game_state_key(game, sfx)] = [] if sfx in ("team_a", "team_b", "selected_ids") else {}
-            st.rerun()
+        if current_role == "admin":
+            st.divider()
+            winner = st.radio("Quem venceu?", ["Time A", "Time B"], horizontal=True, key=game_state_key(game, "winner"))
+            if st.button("Registrar partida", key=game_state_key(game, "register")):
+                register_match(game, team_a, team_b, winner, roles_a if game == "LoL" else None, roles_b if game == "LoL" else None)
+                st.success("Partida registrada e ratings atualizados.")
+                for sfx in ["team_a", "team_b", "selected_ids", "roles_a", "roles_b"]:
+                    st.session_state[game_state_key(game, sfx)] = [] if sfx in ("team_a", "team_b", "selected_ids") else {}
+                st.rerun()
+        else:
+            st.info("Perfil padrao pode apenas selecionar jogadores e sortear times.")
 
 elif page == "Ranking":
     st.markdown("## Ranking")
