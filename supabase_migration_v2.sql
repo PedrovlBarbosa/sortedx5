@@ -1,0 +1,64 @@
+-- ============================================================
+-- SortedX5 - Migracao V2 (CS + LoL + Lanes)
+-- ============================================================
+-- Execute este script no SQL Editor do Supabase.
+-- Seguro para rodar mais de uma vez (idempotente na maior parte dos objetos).
+
+begin;
+
+-- 1) players: ratings separados + lanes de preferencia
+alter table if exists players
+  add column if not exists cs_rating integer,
+  add column if not exists lol_rating integer,
+  add column if not exists lol_lane_1 text,
+  add column if not exists lol_lane_2 text,
+  add column if not exists lol_lane_3 text;
+
+-- Backfill para bancos antigos que tinham apenas rating unico
+update players
+set cs_rating = coalesce(cs_rating, rating, 1000)
+where cs_rating is null;
+
+update players
+set lol_rating = coalesce(lol_rating, rating, 1000)
+where lol_rating is null;
+
+-- Garantir not null nos novos ratings
+alter table players
+  alter column cs_rating set not null,
+  alter column lol_rating set not null;
+
+-- 2) matches: indicar o jogo da partida
+alter table if exists matches
+  add column if not exists game text;
+
+update matches
+set game = coalesce(game, 'CS')
+where game is null;
+
+alter table matches
+  alter column game set not null,
+  alter column game set default 'CS';
+
+-- CHECK de game
+alter table matches drop constraint if exists matches_game_check;
+alter table matches
+  add constraint matches_game_check check (game in ('CS', 'LoL'));
+
+-- 3) match_players: role/lane usada na partida (principalmente LoL)
+alter table if exists match_players
+  add column if not exists role text;
+
+-- 4) indices novos
+create index if not exists idx_players_cs_rating on players(cs_rating desc);
+create index if not exists idx_players_lol_rating on players(lol_rating desc);
+create index if not exists idx_matches_game on matches(game);
+create index if not exists idx_match_players_role on match_players(role);
+
+commit;
+
+-- Verificacao rapida (opcional):
+-- select column_name, data_type
+-- from information_schema.columns
+-- where table_name in ('players', 'matches', 'match_players')
+-- order by table_name, ordinal_position;
