@@ -7,7 +7,7 @@ from __future__ import annotations
 
 import base64
 from collections.abc import Mapping
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import hashlib
 import hmac
 from itertools import combinations, permutations
@@ -17,6 +17,10 @@ from typing import Any, cast
 from uuid import uuid4
 
 import streamlit as st
+try:
+    import extra_streamlit_components as stx  # type: ignore[import-not-found]
+except ImportError:
+    stx = None
 
 try:
     from supabase import Client, create_client
@@ -220,6 +224,95 @@ def _auth_enabled() -> bool:
     return True
 
 
+@st.cache_resource
+def get_cookie_manager() -> Any:
+    if stx is None:
+        return None
+    return stx.CookieManager()
+
+
+def _auth_cookie_name() -> str:
+    auth_cfg = st.secrets.get("auth", {})
+    if isinstance(auth_cfg, Mapping) and auth_cfg.get("cookie_name"):
+        return str(auth_cfg.get("cookie_name"))
+    return "sortedx5_auth"
+
+
+def _auth_cookie_secret() -> str:
+    auth_cfg = st.secrets.get("auth", {})
+    if isinstance(auth_cfg, Mapping) and auth_cfg.get("cookie_secret"):
+        return str(auth_cfg.get("cookie_secret"))
+    return "sortedx5-dev-secret-change-me"
+
+
+def _auth_cookie_days() -> int:
+    auth_cfg = st.secrets.get("auth", {})
+    if isinstance(auth_cfg, Mapping) and auth_cfg.get("cookie_days") is not None:
+        raw_days = auth_cfg.get("cookie_days")
+        if raw_days is None:
+            return 7
+        try:
+            return max(1, int(str(raw_days)))
+        except Exception:
+            return 7
+    return 7
+
+
+def _auth_sign(payload: str) -> str:
+    secret = _auth_cookie_secret().encode("utf-8")
+    return hmac.new(secret, payload.encode("utf-8"), hashlib.sha256).hexdigest()
+
+
+def _create_auth_token(username: str, role: str) -> str:
+    exp_ts = int((datetime.now(timezone.utc) + timedelta(days=_auth_cookie_days())).timestamp())
+    payload = f"{username}|{role}|{exp_ts}"
+    signature = _auth_sign(payload)
+    token_raw = f"{payload}|{signature}"
+    return base64.urlsafe_b64encode(token_raw.encode("utf-8")).decode("ascii")
+
+
+def _decode_auth_token(token: str) -> tuple[str, str] | None:
+    try:
+        decoded = base64.urlsafe_b64decode(token.encode("ascii")).decode("utf-8")
+        username, role, exp_ts, signature = decoded.split("|", 3)
+        payload = f"{username}|{role}|{exp_ts}"
+        if not hmac.compare_digest(signature, _auth_sign(payload)):
+            return None
+        if int(exp_ts) < int(datetime.now(timezone.utc).timestamp()):
+            return None
+        return username, _normalize_role(role)
+    except Exception:
+        return None
+
+
+def _set_auth_cookie(username: str, role: str) -> None:
+    cookie = get_cookie_manager()
+    if cookie is None:
+        return
+    token = _create_auth_token(username, role)
+    cookie.set(
+        _auth_cookie_name(),
+        token,
+        expires_at=datetime.utcnow() + timedelta(days=_auth_cookie_days()),
+        key="set_auth_cookie",
+    )
+
+
+def _clear_auth_cookie() -> None:
+    cookie = get_cookie_manager()
+    if cookie is None:
+        return
+    try:
+        cookie.delete(_auth_cookie_name(), key="del_auth_cookie")
+    except Exception:
+        cookie.set(
+            _auth_cookie_name(),
+            "",
+            expires_at=datetime.utcnow() - timedelta(days=1),
+            key="expire_auth_cookie",
+        )
+
+
 def ensure_login() -> tuple[str, str]:
     if not _auth_enabled():
         return "local", "admin"
@@ -249,11 +342,26 @@ role = "standard"
     if st.session_state.get("auth_ok"):
         return str(st.session_state.get("auth_user")), _normalize_role(st.session_state.get("auth_role"))
 
+    cookie = get_cookie_manager()
+    if cookie is not None:
+        cookie_token = cookie.get(_auth_cookie_name())
+        if cookie_token:
+            parsed = _decode_auth_token(str(cookie_token))
+            if parsed:
+                user_from_cookie, role_from_cookie = parsed
+                user_cfg = users.get(user_from_cookie)
+                if user_cfg and _normalize_role(user_cfg.get("role")) == role_from_cookie:
+                    st.session_state["auth_ok"] = True
+                    st.session_state["auth_user"] = user_from_cookie
+                    st.session_state["auth_role"] = role_from_cookie
+                    return user_from_cookie, role_from_cookie
+
     st.markdown("## Login")
     st.caption("Acesso restrito por perfil.")
     with st.form("login_form"):
         username = st.text_input("Usuario")
         password = st.text_input("Senha", type="password")
+        remember = st.checkbox("Manter login neste dispositivo", value=True)
         submit = st.form_submit_button("Entrar")
 
     if submit:
@@ -265,6 +373,8 @@ role = "standard"
             st.session_state["auth_ok"] = True
             st.session_state["auth_user"] = user["username"]
             st.session_state["auth_role"] = user["role"]
+            if remember:
+                _set_auth_cookie(user["username"], user["role"])
             st.rerun()
 
     st.stop()
@@ -914,6 +1024,7 @@ st.sidebar.caption(f"Usuario: {current_user} ({current_role})")
 if st.sidebar.button("Sair"):
     for k in ["auth_ok", "auth_user", "auth_role"]:
         st.session_state.pop(k, None)
+    _clear_auth_cookie()
     st.rerun()
 
 if current_role == "admin":
