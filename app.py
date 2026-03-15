@@ -44,6 +44,8 @@ ALLOWED_ROLES = {ROLE_ADMIN_SUPER, ROLE_ADMIN, ROLE_STANDARD, ROLE_VIEWER}
 MAX_REDRAWS_PER_ROUND = 6
 MAX_LOGIN_ATTEMPTS = 5
 LOGIN_LOCK_MINUTES = 15
+DEFAULT_SESSION_IDLE_MINUTES = 120
+DEFAULT_SESSION_MAX_HOURS = 24
 
 
 def inject_theme() -> None:
@@ -172,6 +174,51 @@ def inject_theme() -> None:
         small, .stCaption, [data-testid="stCaptionContainer"] {
             color: #94A3B8 !important;
         }
+
+        .sx-topbar {
+            background: linear-gradient(180deg, rgba(23, 30, 40, 0.9), rgba(23, 30, 40, 0.75));
+            border: 1px solid var(--sx-border);
+            border-radius: 14px;
+            padding: 10px 14px;
+            margin-bottom: 10px;
+        }
+
+        .sx-topbar strong {
+            color: #EAF2FF;
+            letter-spacing: 0.2px;
+        }
+
+        @media (max-width: 900px) {
+            .stApp > header {
+                background: transparent;
+            }
+
+            section.main > div {
+                padding-top: 0.5rem;
+                padding-left: 0.6rem;
+                padding-right: 0.6rem;
+            }
+
+            h1, h2 {
+                font-size: 1.25rem !important;
+            }
+
+            .sx-topbar {
+                padding: 10px;
+                border-radius: 12px;
+            }
+
+            .stButton > button,
+            .stDownloadButton > button {
+                width: 100%;
+                min-height: 42px;
+            }
+
+            [data-testid="stSidebar"] {
+                min-width: 86vw;
+                max-width: 86vw;
+            }
+        }
         </style>
         """,
         unsafe_allow_html=True,
@@ -266,14 +313,35 @@ def _auth_cookie_days() -> int:
     return 7
 
 
+def _auth_idle_minutes() -> int:
+    auth_cfg = st.secrets.get("auth", {})
+    if isinstance(auth_cfg, Mapping) and auth_cfg.get("session_idle_minutes") is not None:
+        try:
+            return max(5, int(str(auth_cfg.get("session_idle_minutes"))))
+        except Exception:
+            return DEFAULT_SESSION_IDLE_MINUTES
+    return DEFAULT_SESSION_IDLE_MINUTES
+
+
+def _auth_session_max_hours() -> int:
+    auth_cfg = st.secrets.get("auth", {})
+    if isinstance(auth_cfg, Mapping) and auth_cfg.get("session_max_hours") is not None:
+        try:
+            return max(1, int(str(auth_cfg.get("session_max_hours"))))
+        except Exception:
+            return DEFAULT_SESSION_MAX_HOURS
+    return DEFAULT_SESSION_MAX_HOURS
+
+
 def _auth_sign(payload: str) -> str:
     secret = _auth_cookie_secret().encode("utf-8")
     return hmac.new(secret, payload.encode("utf-8"), hashlib.sha256).hexdigest()
 
 
 def _create_auth_token(username: str, role: str) -> str:
+    now_ts = int(datetime.now(timezone.utc).timestamp())
     exp_ts = int((datetime.now(timezone.utc) + timedelta(days=_auth_cookie_days())).timestamp())
-    payload = f"{username}|{role}|{exp_ts}"
+    payload = f"{username}|{role}|{exp_ts}|{now_ts}"
     signature = _auth_sign(payload)
     token_raw = f"{payload}|{signature}"
     return base64.urlsafe_b64encode(token_raw.encode("utf-8")).decode("ascii")
@@ -282,8 +350,17 @@ def _create_auth_token(username: str, role: str) -> str:
 def _decode_auth_token(token: str) -> tuple[str, str] | None:
     try:
         decoded = base64.urlsafe_b64decode(token.encode("ascii")).decode("utf-8")
-        username, role, exp_ts, signature = decoded.split("|", 3)
-        payload = f"{username}|{role}|{exp_ts}"
+        parts = decoded.split("|")
+        if len(parts) == 5:
+            username, role, exp_ts, seen_ts, signature = parts
+            payload = f"{username}|{role}|{exp_ts}|{seen_ts}"
+            if int(datetime.now(timezone.utc).timestamp()) - int(seen_ts) > _auth_idle_minutes() * 60:
+                return None
+        elif len(parts) == 4:
+            username, role, exp_ts, signature = parts
+            payload = f"{username}|{role}|{exp_ts}"
+        else:
+            return None
         if not hmac.compare_digest(signature, _auth_sign(payload)):
             return None
         if int(exp_ts) < int(datetime.now(timezone.utc).timestamp()):
@@ -304,6 +381,25 @@ def _set_auth_cookie(username: str, role: str) -> None:
         expires_at=datetime.utcnow() + timedelta(days=_auth_cookie_days()),
         key="set_auth_cookie",
     )
+
+
+def _persist_auth_tokens(username: str, role: str) -> None:
+    _set_query_auth_token(_create_auth_token(username, role))
+    _set_auth_cookie(username, role)
+
+
+def _clear_local_auth_state() -> None:
+    for k in [
+        "auth_ok",
+        "auth_user_id",
+        "auth_user",
+        "auth_role",
+        "auth_persistent",
+        "auth_last_seen_ts",
+        "auth_started_ts",
+        "auth_last_token_refresh_ts",
+    ]:
+        st.session_state.pop(k, None)
 
 
 def _clear_auth_cookie() -> None:
@@ -404,15 +500,33 @@ def ensure_login() -> tuple[str, str]:
     _bootstrap_auth_users_if_needed()
 
     if st.session_state.get("auth_ok"):
+        now_ts = int(datetime.now(timezone.utc).timestamp())
+        last_seen = int(st.session_state.get("auth_last_seen_ts") or now_ts)
+        started = int(st.session_state.get("auth_started_ts") or now_ts)
+        if now_ts - last_seen > _auth_idle_minutes() * 60:
+            _clear_local_auth_state()
+            st.session_state["auth_expired_msg"] = "Sessao expirada por inatividade. Faca login novamente."
+        elif now_ts - started > _auth_session_max_hours() * 3600:
+            _clear_local_auth_state()
+            st.session_state["auth_expired_msg"] = "Sessao expirada por seguranca. Faca login novamente."
+
+    if st.session_state.get("auth_ok"):
         cached_user = str(st.session_state.get("auth_user") or "").strip().lower()
         row = store.get_auth_user_by_username(cached_user)
         if row and bool(row.get("is_active")):
             role = _normalize_role(row.get("role"))
             st.session_state["auth_role"] = role
             st.session_state["auth_user_id"] = row.get("id")
+            now_ts = int(datetime.now(timezone.utc).timestamp())
+            st.session_state["auth_last_seen_ts"] = now_ts
+
+            if st.session_state.get("auth_persistent"):
+                last_refresh = int(st.session_state.get("auth_last_token_refresh_ts") or 0)
+                if now_ts - last_refresh > 300:
+                    _persist_auth_tokens(cached_user, role)
+                    st.session_state["auth_last_token_refresh_ts"] = now_ts
             return cached_user, role
-        for k in ["auth_ok", "auth_user_id", "auth_user", "auth_role"]:
-            st.session_state.pop(k, None)
+        _clear_local_auth_state()
 
     query_token = _get_query_auth_token()
     if query_token:
@@ -425,6 +539,12 @@ def ensure_login() -> tuple[str, str]:
                 st.session_state["auth_user_id"] = user_cfg.get("id")
                 st.session_state["auth_user"] = user_from_token
                 st.session_state["auth_role"] = role_from_token
+                now_ts = int(datetime.now(timezone.utc).timestamp())
+                st.session_state["auth_started_ts"] = now_ts
+                st.session_state["auth_last_seen_ts"] = now_ts
+                st.session_state["auth_persistent"] = True
+                st.session_state["auth_last_token_refresh_ts"] = now_ts
+                _persist_auth_tokens(user_from_token, role_from_token)
                 return user_from_token, role_from_token
 
     cookie = get_cookie_manager()
@@ -440,9 +560,18 @@ def ensure_login() -> tuple[str, str]:
                     st.session_state["auth_user_id"] = user_cfg.get("id")
                     st.session_state["auth_user"] = user_from_cookie
                     st.session_state["auth_role"] = role_from_cookie
+                    now_ts = int(datetime.now(timezone.utc).timestamp())
+                    st.session_state["auth_started_ts"] = now_ts
+                    st.session_state["auth_last_seen_ts"] = now_ts
+                    st.session_state["auth_persistent"] = True
+                    st.session_state["auth_last_token_refresh_ts"] = now_ts
+                    _persist_auth_tokens(user_from_cookie, role_from_cookie)
                     return user_from_cookie, role_from_cookie
 
     st.markdown("## Login")
+    expired_msg = st.session_state.pop("auth_expired_msg", None)
+    if expired_msg:
+        st.warning(str(expired_msg))
     st.caption("Acesso restrito por perfil.")
     with st.form("login_form"):
         username = st.text_input("Usuario")
@@ -478,9 +607,16 @@ def ensure_login() -> tuple[str, str]:
                 st.session_state["auth_user_id"] = user.get("id")
                 st.session_state["auth_user"] = str(user.get("username"))
                 st.session_state["auth_role"] = role
+                now_ts = int(datetime.now(timezone.utc).timestamp())
+                st.session_state["auth_started_ts"] = now_ts
+                st.session_state["auth_last_seen_ts"] = now_ts
+                st.session_state["auth_persistent"] = bool(remember)
                 if remember:
-                    _set_query_auth_token(_create_auth_token(str(user.get("username")), role))
-                    _set_auth_cookie(str(user.get("username")), role)
+                    _persist_auth_tokens(str(user.get("username")), role)
+                    st.session_state["auth_last_token_refresh_ts"] = now_ts
+                else:
+                    _clear_query_auth_token()
+                    _clear_auth_cookie()
                 st.rerun()
 
     with st.expander("Criar conta"):
@@ -1349,6 +1485,7 @@ def ensure_mm_state(game: str) -> None:
         ("roles_a", {}),
         ("roles_b", {}),
         ("redraw_count", 0),
+        ("reset_selected_names", False),
     ]:
         sk = game_state_key(game, key)
         if sk not in st.session_state:
@@ -1368,8 +1505,7 @@ if st.sidebar.button("Atualizar dados agora"):
     st.rerun()
 
 if st.sidebar.button("Sair"):
-    for k in ["auth_ok", "auth_user_id", "auth_user", "auth_role"]:
-        st.session_state.pop(k, None)
+    _clear_local_auth_state()
     _clear_query_auth_token()
     _clear_auth_cookie()
     st.rerun()
@@ -1384,7 +1520,31 @@ elif current_role == ROLE_STANDARD:
 else:
     pages = ["Prints", "Ranking", "Historico"]
 
-page = st.sidebar.radio("Navegacao", pages)
+if st.session_state.get("sx_page") not in pages:
+    st.session_state["sx_page"] = pages[0]
+
+sidebar_choice = st.sidebar.radio("Navegacao", pages, index=pages.index(str(st.session_state["sx_page"])))
+if sidebar_choice != st.session_state["sx_page"]:
+    st.session_state["sx_page"] = sidebar_choice
+    st.rerun()
+
+st.markdown(
+    f"<div class='sx-topbar'><strong>Sessao:</strong> {st.session_state['sx_page']} &nbsp;|&nbsp; "
+    f"<strong>Perfil:</strong> {current_role} &nbsp;|&nbsp; "
+    f"<strong>Atualizado:</strong> {st.session_state['last_manual_refresh']}</div>",
+    unsafe_allow_html=True,
+)
+
+quick_choice = st.selectbox(
+    "Navegacao rapida (ideal para celular)",
+    options=pages,
+    index=pages.index(str(st.session_state["sx_page"])),
+)
+if quick_choice != st.session_state["sx_page"]:
+    st.session_state["sx_page"] = quick_choice
+    st.rerun()
+
+page = str(st.session_state["sx_page"])
 
 players = store.load_players()
 
@@ -1468,12 +1628,18 @@ elif page == "Matchmaking":
         st.warning(f"Cadastre pelo menos 10 jogadores. Atual: {len(players)}")
         st.stop()
 
+    selected_names_key = game_state_key(game, "selected_names")
+    reset_key = game_state_key(game, "reset_selected_names")
+    if st.session_state.get(reset_key):
+        st.session_state.pop(selected_names_key, None)
+        st.session_state[reset_key] = False
+
     names = [p["name"] for p in players]
     selected_names = st.multiselect(
         "Selecione 10 jogadores",
         options=names,
         max_selections=10,
-        key=game_state_key(game, "selected_names"),
+        key=selected_names_key,
     )
 
     c1, c2, c3 = st.columns([1, 1, 2])
@@ -1515,7 +1681,7 @@ elif page == "Matchmaking":
     if c3.button("Limpar sorteador", key=game_state_key(game, "clear")):
         for sfx in ["team_a", "team_b", "selected_ids", "roles_a", "roles_b"]:
             st.session_state[game_state_key(game, sfx)] = [] if sfx in ("team_a", "team_b", "selected_ids") else {}
-        st.session_state[game_state_key(game, "selected_names")] = []
+        st.session_state[reset_key] = True
         st.session_state[game_state_key(game, "redraw_count")] = 0
         st.rerun()
 
@@ -1561,7 +1727,7 @@ elif page == "Matchmaking":
                 st.success("Partida registrada e ratings atualizados.")
                 for sfx in ["team_a", "team_b", "selected_ids", "roles_a", "roles_b"]:
                     st.session_state[game_state_key(game, sfx)] = [] if sfx in ("team_a", "team_b", "selected_ids") else {}
-                st.session_state[game_state_key(game, "selected_names")] = []
+                st.session_state[reset_key] = True
                 st.session_state[game_state_key(game, "redraw_count")] = 0
                 st.rerun()
         else:
