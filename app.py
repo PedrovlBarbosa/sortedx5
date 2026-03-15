@@ -314,6 +314,31 @@ def _clear_auth_cookie() -> None:
         )
 
 
+def _get_query_auth_token() -> str | None:
+    try:
+        token: Any = st.query_params.get("sx_auth")
+    except Exception:
+        return None
+    if isinstance(token, list):
+        return str(token[0]) if token else None
+    return str(token) if token else None
+
+
+def _set_query_auth_token(token: str) -> None:
+    try:
+        st.query_params["sx_auth"] = token
+    except Exception:
+        pass
+
+
+def _clear_query_auth_token() -> None:
+    try:
+        if "sx_auth" in st.query_params:
+            del st.query_params["sx_auth"]
+    except Exception:
+        pass
+
+
 def ensure_login() -> tuple[str, str]:
     if not _auth_enabled():
         return "local", "admin"
@@ -342,6 +367,18 @@ role = "standard"
 
     if st.session_state.get("auth_ok"):
         return str(st.session_state.get("auth_user")), _normalize_role(st.session_state.get("auth_role"))
+
+    query_token = _get_query_auth_token()
+    if query_token:
+        parsed = _decode_auth_token(query_token)
+        if parsed:
+            user_from_token, role_from_token = parsed
+            user_cfg = users.get(user_from_token)
+            if user_cfg and _normalize_role(user_cfg.get("role")) == role_from_token:
+                st.session_state["auth_ok"] = True
+                st.session_state["auth_user"] = user_from_token
+                st.session_state["auth_role"] = role_from_token
+                return user_from_token, role_from_token
 
     cookie = get_cookie_manager()
     if cookie is not None:
@@ -375,6 +412,7 @@ role = "standard"
             st.session_state["auth_user"] = user["username"]
             st.session_state["auth_role"] = user["role"]
             if remember:
+                _set_query_auth_token(_create_auth_token(user["username"], user["role"]))
                 _set_auth_cookie(user["username"], user["role"])
             st.rerun()
 
@@ -1022,9 +1060,18 @@ st.sidebar.title("SortedX5")
 mode_label = "LOCAL (SQLite)" if store.is_local() else "SUPABASE"
 st.sidebar.caption(f"Modo de dados: {mode_label}")
 st.sidebar.caption(f"Usuario: {current_user} ({current_role})")
+if "last_manual_refresh" not in st.session_state:
+    st.session_state["last_manual_refresh"] = datetime.now().strftime("%H:%M:%S")
+
+st.sidebar.caption(f"Ultima atualizacao: {st.session_state['last_manual_refresh']}")
+if st.sidebar.button("Atualizar dados agora"):
+    st.session_state["last_manual_refresh"] = datetime.now().strftime("%H:%M:%S")
+    st.rerun()
+
 if st.sidebar.button("Sair"):
     for k in ["auth_ok", "auth_user", "auth_role"]:
         st.session_state.pop(k, None)
+    _clear_query_auth_token()
     _clear_auth_cookie()
     st.rerun()
 
